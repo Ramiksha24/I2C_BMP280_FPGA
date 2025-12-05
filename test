@@ -1,0 +1,533 @@
+`timescale 1ns / 1ps
+
+module i2c_master_bmp280_tb();
+
+// Clock and Reset
+reg clk_100mhz;
+reg reset_n;
+
+// I2C Master Inputs
+reg [7:0]  i_addr_w_rw;
+reg [15:0] i_sub_addr;
+reg        i_sub_len;
+reg [23:0] i_byte_len;
+reg [7:0]  i_data_write;
+reg        req_trans;
+
+// I2C Master Outputs
+wire [7:0] data_out;
+wire       valid_out;
+wire       busy;
+wire       nack;
+wire       req_data_chunk;
+
+// I2C Bus
+wire sda;
+wire scl;
+
+// Testbench variables
+reg [7:0] write_data_queue [0:255];
+integer write_idx;
+reg [7:0] read_data_buffer [0:255];
+integer read_idx;
+
+// BMP280 Register Addresses
+localparam [7:0] REG_ID        = 8'hD0,
+                 REG_RESET     = 8'hE0,
+                 REG_STATUS    = 8'hF3,
+                 REG_CTRL_MEAS = 8'hF4,
+                 REG_CONFIG    = 8'hF5,
+                 REG_PRESS_MSB = 8'hF7,
+                 REG_TEMP_MSB  = 8'hFA;
+
+// BMP280 I2C Addresses (SDO = GND, so 0x76)
+localparam [7:0] BMP280_ADDR_W = 8'hEC,  // 0x76 << 1 | 0
+                 BMP280_ADDR_R = 8'hED;  // 0x76 << 1 | 1
+
+// Pullup resistors for I2C bus
+pullup(sda);
+pullup(scl);
+
+// DUT Instantiation
+i2c_master dut (
+    .i_clk(clk_100mhz),
+    .reset_n(reset_n),
+    .i_addr_w_rw(i_addr_w_rw),
+    .i_sub_addr(i_sub_addr),
+    .i_sub_len(i_sub_len),
+    .i_byte_len(i_byte_len),
+    .i_data_write(i_data_write),
+    .req_trans(req_trans),
+    .data_out(data_out),
+    .valid_out(valid_out),
+    .scl_o(scl),
+    .sda_o(sda),
+    .req_data_chunk(req_data_chunk),
+    .busy(busy),
+    .nack(nack)
+);
+
+// Corrected I2C Slave Model for BMP280
+reg [7:0] bmp280_regs [0:255];
+reg [7:0] slave_shift_reg;
+reg [2:0] slave_bit_cnt;
+reg [7:0] slave_addr_received;
+reg [7:0] slave_reg_addr;
+reg       slave_rw;
+reg       slave_active;
+integer   slave_byte_cnt;
+
+// Variable for register initialization loop
+integer i;
+
+// Initialize BMP280 registers
+initial begin
+    // Clear all registers
+    for(i = 0; i < 256; i = i + 1) begin
+        bmp280_regs[i] = 8'h00;
+    end
+    
+    // Set chip ID (BMP280 has ID 0x58)
+    bmp280_regs[REG_ID] = 8'h58;
+    
+    // Set some dummy temperature/pressure data for testing
+    bmp280_regs[REG_TEMP_MSB] = 8'h7F;      // Temperature MSB
+    bmp280_regs[REG_TEMP_MSB+1] = 8'hA2;    // Temperature LSB
+    bmp280_regs[REG_TEMP_MSB+2] = 8'h00;    // Temperature XLSB
+    
+    bmp280_regs[REG_PRESS_MSB] = 8'h52;     // Pressure MSB
+    bmp280_regs[REG_PRESS_MSB+1] = 8'h34;   // Pressure LSB
+    bmp280_regs[REG_PRESS_MSB+2] = 8'h80;   // Pressure XLSB
+    
+    // Status register - not measuring, update done
+    bmp280_regs[REG_STATUS] = 8'h00;
+    
+    // Default configuration
+    bmp280_regs[REG_CTRL_MEAS] = 8'h00;
+    bmp280_regs[REG_CONFIG] = 8'h00;
+end
+
+// Simple I2C Slave Behavior - FIXED VERSION
+reg sda_slave_drive;
+reg sda_slave_val;
+assign sda = sda_slave_drive ? sda_slave_val : 1'bz;
+
+// Slave state machine
+localparam SLAVE_IDLE = 0,
+           SLAVE_ADDR = 1,
+           SLAVE_ACK_ADDR = 2,
+           SLAVE_REG_ADDR = 3,
+           SLAVE_ACK_REG = 4,
+           SLAVE_DATA_TX = 5,
+           SLAVE_DATA_RX = 6,
+           SLAVE_ACK_DATA = 7,
+           SLAVE_WAIT_STOP = 8;
+
+reg [3:0] slave_state;
+
+initial begin
+    sda_slave_drive = 0;
+    sda_slave_val = 1;
+    slave_state = SLAVE_IDLE;
+    slave_active = 0;
+    slave_bit_cnt = 0;
+    slave_byte_cnt = 0;
+    slave_shift_reg = 0;
+end
+
+// Detect START and STOP conditions
+reg sda_prev, scl_prev;
+always @(posedge clk_100mhz or negedge reset_n) begin
+    if(!reset_n) begin
+        sda_prev <= 1;
+        scl_prev <= 1;
+    end else begin
+        sda_prev <= sda;
+        scl_prev <= scl;
+    end
+end
+
+wire start_condition = scl_prev && scl && sda_prev && !sda;
+wire stop_condition = scl_prev && scl && !sda_prev && sda;
+
+// Slave I2C handler - CORRECTED VERSION
+always @(posedge clk_100mhz or negedge reset_n) begin
+    if(!reset_n) begin
+        slave_state <= SLAVE_IDLE;
+        sda_slave_drive <= 0;
+        slave_active <= 0;
+        slave_bit_cnt <= 0;
+        slave_shift_reg <= 0;
+    end else begin
+        // Detect START
+        if(start_condition) begin
+            slave_state <= SLAVE_ADDR;
+            slave_bit_cnt <= 0;
+            slave_active <= 1;
+            sda_slave_drive <= 0;
+            slave_shift_reg <= 0;  // Clear shift register
+            $display("TB: SLAVE | TIME: %t | START detected", $time);
+        end
+        
+        // Detect STOP
+        if(stop_condition) begin
+            slave_state <= SLAVE_IDLE;
+            sda_slave_drive <= 0;
+            slave_active <= 0;
+            $display("TB: SLAVE | TIME: %t | STOP detected", $time);
+        end
+        
+        // State machine on SCL rising edge (sample data)
+        if(scl && !scl_prev && slave_active) begin
+            case(slave_state)
+                SLAVE_ADDR: begin
+                    // Shift left to make room for new bit at LSB position
+                    // We're receiving MSB first
+                    slave_shift_reg <= {slave_shift_reg[6:0], sda};
+                    slave_bit_cnt <= slave_bit_cnt + 1;
+                    if(slave_bit_cnt == 7) begin
+                        // After 8 bits, we have the complete address + R/W
+                        slave_addr_received <= {slave_shift_reg[6:0], sda};
+                        slave_rw <= sda;  // LSB is R/W bit
+                        $display("TB: SLAVE | TIME: %t | Address received: 0x%02h, RW=%b", 
+                                $time, {slave_shift_reg[6:0], sda}, sda);
+                        // Move to ACK state on next falling edge
+                    end
+                end
+                
+                SLAVE_REG_ADDR: begin
+                    slave_shift_reg <= {slave_shift_reg[6:0], sda};
+                    slave_bit_cnt <= slave_bit_cnt + 1;
+                    if(slave_bit_cnt == 7) begin
+                        slave_reg_addr <= {slave_shift_reg[6:0], sda};
+                        $display("TB: SLAVE | TIME: %t | Register address: 0x%02h", 
+                                $time, {slave_shift_reg[6:0], sda});
+                        // Move to ACK state on next falling edge
+                    end
+                end
+                
+                SLAVE_DATA_RX: begin
+                    slave_shift_reg <= {slave_shift_reg[6:0], sda};
+                    slave_bit_cnt <= slave_bit_cnt + 1;
+                    if(slave_bit_cnt == 7) begin
+                        bmp280_regs[slave_reg_addr] <= {slave_shift_reg[6:0], sda};
+                        $display("TB: SLAVE | TIME: %t | Data received: 0x%02h at reg 0x%02h", 
+                                $time, {slave_shift_reg[6:0], sda}, slave_reg_addr);
+                        slave_reg_addr <= slave_reg_addr + 1;
+                        // Move to ACK state on next falling edge
+                    end
+                end
+                
+                SLAVE_DATA_TX: begin
+                    // Just increment bit count, data is sent on falling edge
+                    slave_bit_cnt <= slave_bit_cnt + 1;
+                    if(slave_bit_cnt == 7) begin
+                        $display("TB: SLAVE | TIME: %t | Byte sent: 0x%02h from reg 0x%02h", 
+                                $time, bmp280_regs[slave_reg_addr], slave_reg_addr);
+                        slave_reg_addr <= slave_reg_addr + 1;
+                    end
+                end
+            endcase
+        end
+        
+        // State machine on SCL falling edge (drive data/ack)
+        if(!scl && scl_prev && slave_active) begin
+            case(slave_state)
+                SLAVE_ADDR: begin
+                    // We just finished receiving address, send ACK/NACK
+                    if(slave_bit_cnt == 8) begin
+                        // Check if address matches (0x76 = 0b1110110)
+                        if(slave_addr_received[7:1] == 7'b1110110) begin
+                            sda_slave_drive <= 1;
+                            sda_slave_val <= 0; // ACK
+                            slave_bit_cnt <= 0;
+                            slave_shift_reg <= 0;
+                            if(slave_rw) begin
+                                // Read operation
+                                slave_state <= SLAVE_DATA_TX;
+                                // Load first data byte to send
+                                slave_shift_reg <= bmp280_regs[slave_reg_addr];
+                            end else begin
+                                // Write operation
+                                slave_state <= SLAVE_REG_ADDR;
+                            end
+                        end else begin
+                            // Wrong address - NACK
+                            sda_slave_drive <= 1;
+                            sda_slave_val <= 1; // NACK
+                            slave_state <= SLAVE_IDLE;
+                        end
+                    end
+                end
+                
+                SLAVE_REG_ADDR: begin
+                    // We just finished receiving register address
+                    if(slave_bit_cnt == 8) begin
+                        sda_slave_drive <= 1;
+                        sda_slave_val <= 0; // ACK
+                        slave_bit_cnt <= 0;
+                        slave_shift_reg <= 0;
+                        if(slave_rw) begin
+                            // Read from this register
+                            slave_state <= SLAVE_DATA_TX;
+                            slave_shift_reg <= bmp280_regs[slave_reg_addr];
+                        end else begin
+                            // Write to this register
+                            slave_state <= SLAVE_DATA_RX;
+                        end
+                    end
+                end
+                
+                SLAVE_DATA_RX: begin
+                    // We just finished receiving a data byte
+                    if(slave_bit_cnt == 8) begin
+                        sda_slave_drive <= 1;
+                        sda_slave_val <= 0; // ACK
+                        slave_bit_cnt <= 0;
+                        slave_shift_reg <= 0;
+                        slave_state <= SLAVE_DATA_RX; // Stay here for more bytes
+                    end
+                end
+                
+                SLAVE_DATA_TX: begin
+                    // Drive data bits on falling edge
+                    sda_slave_drive <= 1;
+                    if(slave_bit_cnt == 0) begin
+                        // First falling edge after ACK - send MSB
+                        sda_slave_val <= slave_shift_reg[7];
+                    end else begin
+                        // Send next bit
+                        sda_slave_val <= slave_shift_reg[7 - slave_bit_cnt];
+                    end
+                    
+                    if(slave_bit_cnt == 7) begin
+                        // After sending last bit, release line for ACK
+                        sda_slave_drive <= 0;
+                    end
+                end
+                
+                SLAVE_ACK_DATA: begin
+                    // Master ACK/NACK for read data
+                    sda_slave_drive <= 0; // Release line
+                    slave_bit_cnt <= 0;
+                    if(sda) begin // NACK from master means stop reading
+                        slave_state <= SLAVE_WAIT_STOP;
+                    end else begin // ACK from master means continue
+                        slave_state <= SLAVE_DATA_TX;
+                        slave_shift_reg <= bmp280_regs[slave_reg_addr];
+                    end
+                end
+                
+                default: begin
+                    sda_slave_drive <= 0;
+                end
+            endcase
+        end
+        
+        // Handle master's ACK during read
+        if(slave_state == SLAVE_DATA_TX && slave_bit_cnt == 8) begin
+            // Just sent last bit, wait for master's ACK
+            slave_state <= SLAVE_ACK_DATA;
+            slave_bit_cnt <= 0;
+        end
+    end
+end
+
+// Handle multi-byte write data feeding
+always @(posedge clk_100mhz) begin
+    if(req_data_chunk) begin
+        i_data_write <= write_data_queue[write_idx];
+        write_idx <= write_idx + 1;
+        $display("TB: MASTER | TIME: %t | Feeding next write data: 0x%h", $time, write_data_queue[write_idx]);
+    end
+end
+
+// Capture read data
+always @(posedge clk_100mhz) begin
+    if(valid_out) begin
+        read_data_buffer[read_idx] <= data_out;
+        read_idx <= read_idx + 1;
+        $display("TB: MASTER | TIME: %t | Read data received: 0x%h", $time, data_out);
+    end
+end
+
+// Clock generation - 100MHz
+initial begin
+    clk_100mhz = 0;
+    forever #5 clk_100mhz = ~clk_100mhz; // 10ns period = 100MHz
+end
+
+// Test stimulus
+initial begin
+    $display("========================================");
+    $display("BMP280 I2C Master Testbench Starting");
+    $display("========================================");
+    
+    // Initialize
+    reset_n = 0;
+    req_trans = 0;
+    i_addr_w_rw = 0;
+    i_sub_addr = 0;
+    i_sub_len = 0;
+    i_byte_len = 0;
+    i_data_write = 0;
+    write_idx = 0;
+    read_idx = 0;
+    
+    // Reset pulse
+    #100;
+    reset_n = 1;
+    #100;
+    
+    $display("\n========================================");
+    $display("TEST 1: Read Chip ID (Register 0xD0)");
+    $display("========================================");
+    @(posedge clk_100mhz);
+    i_addr_w_rw = BMP280_ADDR_R;
+    i_sub_addr = {8'h00, REG_ID}; // Address in lower byte
+    i_sub_len = 1'b0;  // 8-bit address
+    i_byte_len = 24'd1;
+    req_trans = 1'b1;
+    @(posedge clk_100mhz);
+    req_trans = 1'b0;
+    
+    wait(!busy);
+    #1000;
+    
+    if(read_idx > 0 && read_data_buffer[0] == 8'h58)
+        $display("✓ TEST 1 PASSED: Chip ID = 0x%h", read_data_buffer[0]);
+    else if(read_idx > 0)
+        $display("✗ TEST 1 FAILED: Expected 0x58, got 0x%h", read_data_buffer[0]);
+    else
+        $display("✗ TEST 1 FAILED: No data received");
+    
+    read_idx = 0;
+    
+    $display("\n========================================");
+    $display("TEST 2: Write to ctrl_meas (0xF4)");
+    $display("========================================");
+    @(posedge clk_100mhz);
+    write_data_queue[0] = 8'b00100111; // osrs_t=001, osrs_p=001, mode=11
+    write_idx = 0;
+    i_addr_w_rw = BMP280_ADDR_W;
+    i_sub_addr = {8'h00, REG_CTRL_MEAS};
+    i_sub_len = 1'b0;
+    i_byte_len = 24'd1;
+    i_data_write = write_data_queue[0];
+    req_trans = 1'b1;
+    @(posedge clk_100mhz);
+    req_trans = 1'b0;
+    
+    wait(!busy);
+    #1000;
+    
+    if(bmp280_regs[REG_CTRL_MEAS] == 8'b00100111)
+        $display("✓ TEST 2 PASSED: ctrl_meas = 0x%h", bmp280_regs[REG_CTRL_MEAS]);
+    else
+        $display("✗ TEST 2 FAILED: ctrl_meas = 0x%h", bmp280_regs[REG_CTRL_MEAS]);
+    
+    $display("\n========================================");
+    $display("TEST 3: Burst Read - Temperature (3 bytes)");
+    $display("========================================");
+    @(posedge clk_100mhz);
+    read_idx = 0;
+    i_addr_w_rw = BMP280_ADDR_R;
+    i_sub_addr = {8'h00, REG_TEMP_MSB};
+    i_sub_len = 1'b0;
+    i_byte_len = 24'd3;
+    req_trans = 1'b1;
+    @(posedge clk_100mhz);
+    req_trans = 1'b0;
+    
+    wait(!busy);
+    #1000;
+    
+    $display("Temperature data read:");
+    if(read_idx >= 1) $display("  MSB:  0x%h", read_data_buffer[0]);
+    if(read_idx >= 2) $display("  LSB:  0x%h", read_data_buffer[1]);
+    if(read_idx >= 3) $display("  XLSB: 0x%h", read_data_buffer[2]);
+    
+    if(read_idx == 3)
+        $display("✓ TEST 3 PASSED: 3 bytes read");
+    else
+        $display("✗ TEST 3 FAILED: Only %d bytes read", read_idx);
+    
+    $display("\n========================================");
+    $display("TEST 4: Burst Read - Pressure + Temp (6 bytes)");
+    $display("========================================");
+    @(posedge clk_100mhz);
+    read_idx = 0;
+    i_addr_w_rw = BMP280_ADDR_R;
+    i_sub_addr = {8'h00, REG_PRESS_MSB};
+    i_sub_len = 1'b0;
+    i_byte_len = 24'd6;
+    req_trans = 1'b1;
+    @(posedge clk_100mhz);
+    req_trans = 1'b0;
+    
+    wait(!busy);
+    #1000;
+    
+    $display("Pressure + Temperature data read:");
+    if(read_idx >= 1) $display("  Press MSB:  0x%h", read_data_buffer[0]);
+    if(read_idx >= 2) $display("  Press LSB:  0x%h", read_data_buffer[1]);
+    if(read_idx >= 3) $display("  Press XLSB: 0x%h", read_data_buffer[2]);
+    if(read_idx >= 4) $display("  Temp MSB:   0x%h", read_data_buffer[3]);
+    if(read_idx >= 5) $display("  Temp LSB:   0x%h", read_data_buffer[4]);
+    if(read_idx >= 6) $display("  Temp XLSB:  0x%h", read_data_buffer[5]);
+    
+    if(read_idx == 6)
+        $display("✓ TEST 4 PASSED: 6 bytes read");
+    else
+        $display("✗ TEST 4 FAILED: Only %d bytes read", read_idx);
+    
+    $display("\n========================================");
+    $display("TEST 5: Multi-byte Write");
+    $display("========================================");
+    @(posedge clk_100mhz);
+    write_data_queue[0] = 8'hA5;
+    write_data_queue[1] = 8'h5A;
+    write_data_queue[2] = 8'h3C;
+    write_idx = 0;
+    i_addr_w_rw = BMP280_ADDR_W;
+    i_sub_addr = {8'h00, 8'h10}; // Test register at 0x10
+    i_sub_len = 1'b0;
+    i_byte_len = 24'd3;
+    i_data_write = write_data_queue[0];
+    req_trans = 1'b1;
+    @(posedge clk_100mhz);
+    req_trans = 1'b0;
+    
+    wait(!busy);
+    #1000;
+    
+    if(bmp280_regs[8'h10] == 8'hA5 && 
+       bmp280_regs[8'h11] == 8'h5A && 
+       bmp280_regs[8'h12] == 8'h3C)
+        $display("✓ TEST 5 PASSED: Multi-byte write successful");
+    else
+        $display("✗ TEST 5 FAILED: Write data mismatch. Got: 0x%h, 0x%h, 0x%h",
+                bmp280_regs[8'h10], bmp280_regs[8'h11], bmp280_regs[8'h12]);
+    
+    $display("\n========================================");
+    $display("All Tests Complete!");
+    $display("========================================");
+    
+    #5000;
+    $finish;
+end
+
+// Timeout watchdog
+initial begin
+    #5000000; // 5ms timeout
+    $display("ERROR: Testbench timeout!");
+    $finish;
+end
+
+// Optional: Waveform dump
+initial begin
+    $dumpfile("i2c_bmp280_tb.vcd");
+    $dumpvars(0, i2c_master_bmp280_tb);
+end
+
+endmodule
