@@ -1,0 +1,408 @@
+`timescale 1fs/1fs
+module i2c_master #(
+    parameter DEBUG = 0
+)(
+    input             i_clk,
+    input             reset_n,
+
+    // Separate address inputs
+    input      [7:0]  i_addr_write,  // e.g. EC
+    input      [7:0]  i_addr_read,   // e.g. ED
+
+    input      [15:0] i_sub_addr,
+    input             i_sub_len,
+    input      [23:0] i_byte_len,
+    input      [7:0]  i_data_write,
+    input             req_trans,
+  
+    output reg [7:0]  data_out,
+    output reg        valid_out,
+  
+    output            scl_out,
+    input             scl_in,
+    output            scl_oe, 
+  
+    output            sda_out,
+    input             sda_in,
+    output            sda_oe,
+  
+    output reg        req_data_chunk,
+    output reg        busy,
+    output reg        nack
+  
+    `ifdef EXPOSE_DEBUG_SIGNALS
+    ,
+    output reg [3:0]  state,
+    output reg [3:0]  next_state,
+    output reg        reg_sda_o,
+    output reg [7:0]  addr,
+    output reg        rw,
+    output reg [15:0] sub_addr,
+    output reg        sub_len,
+    output reg [23:0] byte_len,
+    output reg        en_scl,
+    output reg        byte_sent,
+    output reg [23:0] num_byte_sent,
+    output reg [2:0]  cntr,
+    output reg [7:0]  byte_sr,
+    output reg        read_sub_addr_sent_flag,
+    output reg [7:0]  data_to_write,
+    output reg [7:0]  data_in_sr,
+    output reg        clk_i2c,
+    output reg [15:0] clk_i2c_cntr,
+    output reg        sda_prev,
+    output reg [1:0]  sda_curr,
+    output reg        scl_prev,
+    output reg        scl_curr,
+    output reg        ack_in_prog,
+    output reg        ack_nack,
+    output reg        en_end_indicator,
+    output reg        grab_next_data,
+    output reg        scl_is_high,
+    output reg        scl_is_low,
+    output reg        release_sda_next
+    `endif
+);
+
+// FSM states
+localparam [3:0] IDLE        = 4'd0,
+                 START       = 4'd1,
+                 RESTART     = 4'd2,
+                 SLAVE_ADDR  = 4'd3,
+                 SUB_ADDR    = 4'd4,
+                 READ        = 4'd5,
+                 WRITE       = 4'd6,
+                 GRAB_DATA   = 4'd7,
+                 ACK_NACK_RX = 4'd8,
+                 ACK_NACK_TX = 4'd9,
+                 STOP        = 4'hA,
+                 RELEASE_BUS = 4'hB;
+
+localparam [15:0] DIV_200MHZ = 16'd250;
+localparam [7:0]  START_IND_SETUP  = 70,
+                  DATA_HOLD_TIME   = 3,
+                  STOP_IND_SETUP   = 60;
+
+`ifndef EXPOSE_DEBUG_SIGNALS
+reg [3:0]  state, next_state;
+reg        reg_sda_o;
+reg [7:0]  addr;
+reg        rw;
+reg [15:0] sub_addr;
+reg        sub_len;
+reg [23:0] byte_len;
+reg        en_scl;
+reg        byte_sent;
+reg [23:0] num_byte_sent;
+reg [2:0]  cntr;
+reg [7:0]  byte_sr;
+reg        read_sub_addr_sent_flag;
+reg [7:0]  data_to_write;
+reg [7:0]  data_in_sr;
+reg        clk_i2c;
+reg [15:0] clk_i2c_cntr;
+reg [1:0]  sda_curr;
+reg        sda_prev;
+reg        scl_prev, scl_curr;
+reg        ack_in_prog;
+reg        ack_nack;
+reg        en_end_indicator;
+reg        grab_next_data;
+reg        scl_is_high;
+reg        scl_is_low;
+reg        release_sda_next;
+
+`endif
+reg scl_curr_sync, scl_prev_sync;
+// Reset synchronizer
+reg [2:0] reset_sync;
+wire reset_n_sync;
+always @(posedge i_clk or negedge reset_n) begin
+    if (!reset_n)
+        reset_sync <= 3'b000;
+    else
+        reset_sync <= {reset_sync[1:0], 1'b1};
+end
+assign reset_n_sync = reset_sync[2];
+
+// I2C clock generation (400kHz from 200MHz)
+always@(posedge i_clk or negedge reset_n_sync) begin
+    if(!reset_n_sync)
+        {clk_i2c_cntr, clk_i2c} <= 17'b1;
+    else if(!en_scl)
+        {clk_i2c_cntr, clk_i2c} <= 17'b1;
+    else begin
+        clk_i2c_cntr <= clk_i2c_cntr + 1;
+        if(clk_i2c_cntr == DIV_200MHZ-1) begin
+            clk_i2c <= !clk_i2c;
+            clk_i2c_cntr <= 0;
+        end
+    end
+end
+
+// Main FSM
+always@(posedge i_clk or negedge reset_n_sync) begin
+    if(!reset_n_sync) begin
+        {data_out, valid_out} <= 0;
+        {req_data_chunk, busy, nack} <= 0;
+        {addr, rw, sub_addr, sub_len, byte_len, en_scl} <= 0;
+        {byte_sent, num_byte_sent, cntr, byte_sr} <= 0;
+        {read_sub_addr_sent_flag, data_to_write, data_in_sr} <= 0;
+        {ack_nack, ack_in_prog, en_end_indicator} <= 0;
+        {scl_is_high, scl_is_low, grab_next_data} <= 0;
+        release_sda_next <= 0;
+        reg_sda_o <= 1'bz;
+        state <= IDLE;
+        next_state <= IDLE;
+    end
+    else begin
+        valid_out <= 1'b0;
+        req_data_chunk <= 1'b0;
+
+        if(release_sda_next) begin
+            reg_sda_o <= 1'bz;
+            release_sda_next <= 1'b0;
+        end
+
+        case(state)
+            IDLE: begin
+                if(req_trans & !busy) begin
+                    busy <= 1'b1;
+                    state <= START;
+                    next_state <= SLAVE_ADDR;
+
+                    addr <= i_addr_write;
+                    rw   <= 1'b0; // always write first
+                    sub_addr <= i_sub_len ? i_sub_addr : {i_sub_addr[7:0], 8'b0};
+                    sub_len <= i_sub_len;
+                    data_to_write <= i_data_write;
+                    byte_len <= i_byte_len;
+
+                    en_scl <= 1'b1;
+                    reg_sda_o <= 1'b1;
+
+                    nack <= 1'b0;
+                    read_sub_addr_sent_flag <= 1'b0;
+                    num_byte_sent <= 0;
+                    byte_sent <= 0;
+                end
+            end
+
+            START: begin
+                if(scl_prev & scl_curr & clk_i2c_cntr == START_IND_SETUP) begin
+                    reg_sda_o <= 1'b0;
+                    byte_sr   <= i_addr_write; // send write address first
+                    state     <= SLAVE_ADDR;
+                end
+            end
+
+            RESTART: begin
+                if(!scl_prev & scl_curr) scl_is_high <= 1'b1;
+                if(scl_is_high && clk_i2c_cntr == START_IND_SETUP) begin
+                    scl_is_high <= 0;
+                    reg_sda_o   <= 0;
+                    state       <= SLAVE_ADDR;
+                    byte_sr     <= i_addr_read; // switch to read address
+                    addr        <= i_addr_read;
+                    rw          <= 1'b1;
+                end
+            end
+
+            SLAVE_ADDR: begin
+    if(byte_sent & cntr[0]) begin
+        byte_sent <= 0;
+        next_state <= read_sub_addr_sent_flag ? READ : SUB_ADDR;
+        byte_sr <= sub_addr[15:8];
+        state   <= ACK_NACK_RX;
+        reg_sda_o <= 1'bz;
+        cntr <= 0;
+    end
+    else if(cntr == 3'd7 && scl_is_low && clk_i2c_cntr == DATA_HOLD_TIME) begin
+        {byte_sent, cntr} <= {byte_sent, cntr} + 1;
+        reg_sda_o <= byte_sr[7];
+        byte_sr   <= {byte_sr[6:0], 1'b0};
+        scl_is_low <= 0;
+        release_sda_next <= 1'b1;
+    end
+    // ✅ ADD THIS:
+    else if(!scl_curr & scl_prev) begin
+        scl_is_low <= 1'b1;
+    end
+    else if(scl_is_low && clk_i2c_cntr == DATA_HOLD_TIME) begin
+        scl_is_low <= 0;
+        {byte_sent, cntr} <= {byte_sent, cntr} + 1;
+        reg_sda_o <= byte_sr[7];
+        byte_sr   <= {byte_sr[6:0], 1'b0};
+    end
+end
+
+                        SUB_ADDR: begin
+                if(byte_sent & cntr[0]) begin
+                    // After sending sub-address, always go to RESTART for a read transaction
+                    read_sub_addr_sent_flag <= 1'b1;
+                    cntr <= 0;
+                    byte_sent <= 0;
+                    state <= ACK_NACK_RX;
+                    reg_sda_o <= 1'bz;
+                    next_state <= RESTART;
+                end
+                else if(cntr == 3'd7 && scl_is_low && clk_i2c_cntr == DATA_HOLD_TIME) begin
+                    {byte_sent, cntr} <= {byte_sent, cntr} + 1;
+                    reg_sda_o <= byte_sr[7];
+                    byte_sr   <= {byte_sr[6:0], 1'b0};
+                    scl_is_low <= 0;
+                    release_sda_next <= 1'b1;
+                end
+                else if(!scl_curr & scl_prev) begin
+                    scl_is_low <= 1'b1;
+                end
+                else if(scl_is_low && clk_i2c_cntr == DATA_HOLD_TIME) begin
+                    scl_is_low <= 0;
+                    {byte_sent, cntr} <= {byte_sent, cntr} + 1;
+                    reg_sda_o <= byte_sr[7];
+                    byte_sr   <= {byte_sr[6:0], 1'b0};
+                end
+            end
+
+            READ: begin
+                if(byte_sent) begin
+                    byte_sent <= 0;
+                    data_out  <= data_in_sr;
+                    valid_out <= 1'b1;
+                    state     <= ACK_NACK_TX;
+                    next_state <= (num_byte_sent == byte_len-1) ? STOP : READ;
+                    ack_nack  <= (num_byte_sent == byte_len-1);
+                    num_byte_sent <= num_byte_sent + 1;
+                    ack_in_prog <= 1'b1;
+                end
+                else begin
+                    reg_sda_o <= 1'bz; // release SDA for slave
+                    if(!scl_prev & scl_curr) scl_is_high <= 1'b1;
+                    if(scl_is_high && clk_i2c_cntr == (DIV_200MHZ >> 1)) begin
+                        valid_out <= 0;
+                        {byte_sent, cntr} <= cntr + 1;
+                        data_in_sr <= {data_in_sr[6:0], sda_prev};
+                        scl_is_high <= 0;
+                    end
+                end
+            end
+
+            WRITE: begin
+                if(byte_sent & cntr[0]) begin
+                    cntr <= 0;
+                    byte_sent <= 0;
+                    state <= ACK_NACK_RX;
+                    reg_sda_o <= 1'bz;
+                    next_state <= (num_byte_sent == byte_len-1) ? STOP : GRAB_DATA;
+                    num_byte_sent <= num_byte_sent + 1;
+                    grab_next_data <= 1'b1;
+                end
+                else if(cntr == 3'd7 && scl_is_low && clk_i2c_cntr == DATA_HOLD_TIME) begin
+                    {byte_sent, cntr} <= {byte_sent, cntr} + 1;
+                    reg_sda_o <= byte_sr[7];
+                    byte_sr   <= {byte_sr[6:0], 1'b0};
+                    scl_is_low <= 0;
+                    release_sda_next <= 1'b1;
+                end
+                else if(!scl_curr & scl_prev) scl_is_low <= 1'b1;
+                else if(scl_is_low && clk_i2c_cntr == DATA_HOLD_TIME) begin
+                    scl_is_low <= 0;
+                    {byte_sent, cntr} <= {byte_sent, cntr} + 1;
+                    reg_sda_o <= byte_sr[7];
+                    byte_sr   <= {byte_sr[6:0], 1'b0};
+                end
+            end
+
+            GRAB_DATA: begin
+                if(grab_next_data) begin
+                    req_data_chunk <= 1'b1;
+                    grab_next_data <= 0;
+                end
+                else begin
+                    state <= WRITE;
+                    byte_sr <= i_data_write;
+                end
+            end
+
+            ACK_NACK_RX: begin
+                if(!scl_prev & scl_curr) scl_is_high <= 1'b1;
+                if(scl_is_high && clk_i2c_cntr == START_IND_SETUP) begin
+                    if(!sda_prev) begin
+                        state <= next_state; // ACK
+                    end else begin
+                        nack <= 1'b1;
+                        busy <= 0;
+                        reg_sda_o <= 1'bz;
+                        en_scl <= 0;
+                        state <= IDLE;       // NACK
+                    end
+                    scl_is_high <= 0;
+                end
+            end
+
+            ACK_NACK_TX: begin
+                if(!scl_curr & scl_prev) scl_is_low <= 1'b1;
+                if(scl_is_low && clk_i2c_cntr == DATA_HOLD_TIME) begin
+                    if(ack_in_prog) begin
+                        reg_sda_o <= ack_nack;
+                        ack_in_prog <= 0;
+                    end else begin
+                        reg_sda_o <= (next_state == STOP) ? 0 : 1'bz;
+                        en_end_indicator <= (next_state == STOP);
+                        state <= next_state;
+                    end
+                    scl_is_low <= 0;
+                end
+            end
+
+            STOP: begin
+                if(!scl_curr & scl_prev & !rw) begin
+                    reg_sda_o <= 0;
+                    en_end_indicator <= 1'b1;
+                end
+                if(scl_curr & scl_prev & en_end_indicator) begin
+                    scl_is_high <= 1'b1;
+                    en_end_indicator <= 0;
+                end
+                if(scl_is_high && clk_i2c_cntr == STOP_IND_SETUP) begin
+                    reg_sda_o <= 1'b1;
+                    state <= RELEASE_BUS;
+                    scl_is_high <= 0;
+                end
+            end
+
+            RELEASE_BUS: begin
+                if(clk_i2c_cntr == DIV_200MHZ-3) begin
+                    en_scl <= 0;
+                    reg_sda_o <= 1'bz;
+                    state <= IDLE;
+                    busy <= 0;
+                end
+            end
+
+            default: state <= IDLE;
+        endcase
+    end
+end
+always @(posedge i_clk or negedge reset_n_sync) begin
+    if (!reset_n_sync) begin
+        {sda_curr, sda_prev} <= 0;
+        {scl_curr, scl_prev} <= 0;
+    end else begin
+        sda_curr <= {sda_curr[0], sda_in};
+        sda_prev <= sda_curr[1];
+        scl_curr <= clk_i2c;
+        scl_prev <= scl_curr;
+    end
+end
+
+
+// SDA/SCL sampling
+
+assign sda_out = (reg_sda_o === 1'bz) ? 1'b1 : reg_sda_o;
+assign sda_oe  = (reg_sda_o !== 1'bz);
+
+assign scl_out = clk_i2c;
+assign scl_oe  = en_scl;
+
+endmodule
