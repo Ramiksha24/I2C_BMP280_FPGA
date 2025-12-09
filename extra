@@ -1,0 +1,76 @@
+module bmp280_controller (
+    input clk,
+    input reset_n,
+    output reg [7:0]  temperature,  // Actual temperature value
+    output reg [23:0] pressure,     // Actual pressure value
+    output reg        data_ready
+);
+
+    // State machine
+    localparam INIT          = 4'd0,
+               READ_CHIP_ID  = 4'd1,
+               CHECK_ID      = 4'd2,
+               READ_CALIB    = 4'd3,
+               WRITE_CONFIG  = 4'd4,
+               READ_TEMP     = 4'd5,
+               CALC_TEMP     = 4'd6,
+               WAIT_1SEC     = 4'd7;
+    
+    always @(posedge clk) begin
+        case(state)
+            INIT: begin
+                i_sub_addr <= 16'h00D0;  // Chip ID
+                i_byte_len <= 1;
+                state <= READ_CHIP_ID;
+            end
+            
+            READ_CHIP_ID: begin
+                if(!busy) begin
+                    req_trans <= 1;
+                    state <= CHECK_ID;
+                end
+            end
+            
+            CHECK_ID: begin
+                if(valid_out && data_out == 8'h58)
+                    state <= READ_CALIB;
+                else
+                    state <= ERROR;
+            end
+            
+            READ_CALIB: begin
+                i_sub_addr <= 16'h0088;  // Calibration data start
+                i_byte_len <= 24;         // Read 24 bytes
+                req_trans <= 1;
+                state <= WRITE_CONFIG;
+            end
+            
+            WRITE_CONFIG: begin
+                i_addr_w_rw <= 8'hEC;    // Write mode
+                i_sub_addr <= 16'h00F4;  // ctrl_meas register
+                i_data_write <= 8'b00100111; // Temp oversampling x1, forced mode
+                req_trans <= 1;
+                state <= READ_TEMP;
+            end
+            
+            READ_TEMP: begin
+                // Read temperature every 1 second
+                i_sub_addr <= 16'h00FA;  // temp_msb
+                i_byte_len <= 3;         // Read 3 bytes
+                state <= CALC_TEMP;
+            end
+            
+            CALC_TEMP: begin
+                // Apply BMP280 compensation formula
+                temperature <= compensated_temp;
+                data_ready <= 1;
+                state <= WAIT_1SEC;
+            end
+            
+            WAIT_1SEC: begin
+                if(counter == 200_000_000)
+                    state <= READ_TEMP;
+            end
+        endcase
+    end
+endmodule
