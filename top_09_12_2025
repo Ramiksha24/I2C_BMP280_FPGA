@@ -1,0 +1,287 @@
+/**
+ * BMP280 I2C Interface Top Module
+ * Target: Artix-7 FPGA @ 200MHz
+ * Features: VIO for control, ILA for debugging
+ */
+
+`timescale 1ns/1ps
+
+module bmp280_top (
+    input  wire clk_200mhz,     // 200MHz system clock
+    input  wire reset_n,        // Active-low reset button
+    
+    // I2C Physical Interface (connect to BMP280)
+    inout  wire scl,
+    inout  wire sda
+);
+
+    //==========================================================================
+    // Internal Signals
+    //==========================================================================
+    
+    // VIO Control Signals
+    wire [7:0]  vio_addr;           // I2C address with R/W bit
+    wire [15:0] vio_sub_addr;       // Register address
+    wire        vio_sub_len;        // 0=8bit reg addr, 1=16bit
+    wire [23:0] vio_byte_len;       // Number of bytes to transfer
+    wire [7:0]  vio_data_write;     // Data to write
+    wire        vio_req;            // Pulse to start transaction
+    
+    // I2C Master Outputs
+    wire [7:0]  data_out;
+    wire        valid_out;
+    wire        req_data_chunk;
+    wire        busy;
+    wire        nack;
+    
+    // Debug Signals from I2C Master
+    wire [3:0]  dbg_state;
+    wire [7:0]  dbg_byte_sr;
+    wire [2:0]  dbg_bit_cntr;
+    wire        dbg_scl_internal;
+    wire        dbg_sda_internal;
+    wire        dbg_sda_in;
+    wire        dbg_scl_in;
+    wire [23:0] dbg_byte_count;
+    
+    // ACK Detection Logic
+    reg         ack_detected;
+    reg  [2:0]  ack_count;
+    wire        in_ack_state;
+    wire        slave_responding;
+    
+    //==========================================================================
+    // ACK Detection (for VIO monitoring)
+    //==========================================================================
+    assign in_ack_state = (dbg_state == 4'd8);  // ACK_NACK_RX state
+    assign slave_responding = in_ack_state && !dbg_sda_in;
+    
+    always @(posedge clk_200mhz or negedge reset_n) begin
+        if (!reset_n) begin
+            ack_detected <= 0;
+            ack_count <= 0;
+        end else begin
+            if (in_ack_state && !dbg_sda_in) begin
+                ack_detected <= 1;
+                if (!ack_detected)
+                    ack_count <= ack_count + 1;
+            end else if (!in_ack_state) begin
+                ack_detected <= 0;
+            end
+        end
+    end
+    
+    //==========================================================================
+    // VIO - Virtual Input/Output for Runtime Control
+    //==========================================================================
+    vio_0 vio_inst (
+        .clk(clk_200mhz),
+        
+        // Control Outputs (set these in hardware manager)
+        .probe_out0(vio_addr),          // [7:0]  - I2C address (0xED for BMP280 read)
+        .probe_out1(vio_sub_addr),      // [15:0] - Register address (0x00D0 for chip ID)
+        .probe_out2(vio_sub_len),       // [0:0]  - 0 for 8-bit register addressing
+        .probe_out3(vio_byte_len),      // [23:0] - Number of bytes (1 for chip ID)
+        .probe_out4(vio_data_write),    // [7:0]  - Data to write (N/A for reads)
+        .probe_out5(vio_req),           // [0:0]  - Pulse 1?0 to start transaction
+        
+        // Status Inputs (monitor these in hardware manager)
+        .probe_in0(busy),               // [0:0]  - Transaction in progress
+        .probe_in1(nack),               // [0:0]  - Slave sent NACK (error)
+        .probe_in2(data_out),           // [7:0]  - Data read from slave (should be 0x58 for chip ID)
+        .probe_in3(valid_out),          // [0:0]  - data_out is valid
+        .probe_in4(ack_detected),       // [0:0]  - ACK was detected from slave
+        .probe_in5(slave_responding),   // [0:0]  - Slave is responding (SDA low during ACK)
+        .probe_in6(dbg_state),          // [3:0]  - Current FSM state
+        .probe_in7(ack_count)           // [2:0]  - Total ACKs received
+    );
+    
+    //==========================================================================
+    // ILA - Integrated Logic Analyzer for Waveform Debugging
+    //==========================================================================
+    ila_3 ila_inst (
+        .clk(clk_200mhz),
+        
+        // I2C Physical Lines (CRITICAL for protocol debugging)
+        .probe0(scl),                   // [0:0] - SCL physical pin
+        .probe1(sda),                   // [0:0] - SDA physical pin (watch for ACK!)
+        
+        // Internal I2C Signals
+        .probe2(dbg_scl_internal),      // [0:0] - Internal 400kHz clock
+        .probe3(dbg_sda_internal),      // [0:0] - Internal SDA control (1'bz when released)
+        .probe4(dbg_sda_in),            // [0:0] - Sampled SDA input
+        .probe5(dbg_scl_in),            // [0:0] - Sampled SCL
+        
+        // FSM State
+        .probe6(dbg_state),             // [3:0] - Current state
+        .probe7(dbg_byte_sr),           // [7:0] - Shift register (data being transmitted)
+        .probe8(dbg_bit_cntr),          // [2:0] - Bit counter (0-7)
+        
+        // Status Signals
+        .probe9(busy),                  // [0:0]
+        .probe10(nack),                 // [0:0]
+        .probe11(valid_out),            // [0:0]
+        .probe12(data_out),             // [7:0] - Data read
+        
+        // ACK Detection
+        .probe13(in_ack_state),         // [0:0] - In ACK state
+        .probe14(slave_responding),     // [0:0] - Slave responding
+        .probe15(ack_detected),         // [0:0]
+        
+        // Transaction Control
+        .probe16(vio_req),              // [0:0] - Transaction trigger
+        .probe17(dbg_byte_count),       // [23:0] - Bytes transferred
+        .probe18(vio_addr)              // [7:0] - Address being used
+    );
+    
+    //==========================================================================
+    // I2C Tri-state Buffer Management
+    //==========================================================================
+    wire scl_out, scl_in, scl_oe;
+    wire sda_out, sda_in, sda_oe;
+    
+    // Tri-state buffers for bidirectional I2C pins
+    assign scl = scl_oe ? scl_out : 1'bz;
+    assign sda = sda_oe ? sda_out : 1'bz;
+    assign scl_in = scl;
+    assign sda_in = sda;
+    
+    //==========================================================================
+    // I2C Master Instance
+    //==========================================================================
+    i2c_master_bmp280 i2c_master_inst (
+        .clk(clk_200mhz),
+        .reset_n(reset_n),
+        
+        // Control Interface
+        .i_addr_w_rw(vio_addr),
+        .i_sub_addr(vio_sub_addr),
+        .i_sub_len(vio_sub_len),
+        .i_byte_len(vio_byte_len),
+        .i_data_write(vio_data_write),
+        .req_trans(vio_req),
+        
+        // Read Interface
+        .data_out(data_out),
+        .valid_out(valid_out),
+        
+        // I2C Physical Interface - Separated signals
+        .scl_out(scl_out),
+        .scl_in(scl_in),
+        .scl_oe(scl_oe),
+        .sda_out(sda_out),
+        .sda_in(sda_in),
+        .sda_oe(sda_oe),
+        
+        // Status
+        .req_data_chunk(req_data_chunk),
+        .busy(busy),
+        .nack(nack),
+        
+        // Debug outputs for ILA
+        .dbg_state(dbg_state),
+        .dbg_byte_sr(dbg_byte_sr),
+        .dbg_bit_cntr(dbg_bit_cntr),
+        .dbg_scl_internal(dbg_scl_internal),
+        .dbg_sda_internal(dbg_sda_internal),
+        .dbg_sda_in(dbg_sda_in),
+        .dbg_scl_in(dbg_scl_in),
+        .dbg_byte_count(dbg_byte_count)
+    );
+
+endmodule
+
+//==============================================================================
+// VIO Configuration Guide
+//==============================================================================
+/*
+Create VIO IP with following configuration:
+- 6 Output Probes (controls):
+  * probe_out0: 8 bits  (vio_addr)
+  * probe_out1: 16 bits (vio_sub_addr)
+  * probe_out2: 1 bit   (vio_sub_len)
+  * probe_out3: 24 bits (vio_byte_len)
+  * probe_out4: 8 bits  (vio_data_write)
+  * probe_out5: 1 bit   (vio_req)
+
+- 8 Input Probes (status):
+  * probe_in0: 1 bit   (busy)
+  * probe_in1: 1 bit   (nack)
+  * probe_in2: 8 bits  (data_out)
+  * probe_in3: 1 bit   (valid_out)
+  * probe_in4: 1 bit   (ack_detected)
+  * probe_in5: 1 bit   (slave_responding)
+  * probe_in6: 4 bits  (dbg_state)
+  * probe_in7: 3 bits  (ack_count)
+*/
+
+//==============================================================================
+// ILA Configuration Guide
+//==============================================================================
+/*
+Create ILA IP with following configuration:
+- 19 Probes (all 1 bit unless specified):
+  * probe0:  1 bit   (scl physical)
+  * probe1:  1 bit   (sda physical)
+  * probe2:  1 bit   (scl internal)
+  * probe3:  1 bit   (sda internal)
+  * probe4:  1 bit   (sda sampled input)
+  * probe5:  1 bit   (scl sampled)
+  * probe6:  4 bits  (state)
+  * probe7:  8 bits  (byte shift register)
+  * probe8:  3 bits  (bit counter)
+  * probe9:  1 bit   (busy)
+  * probe10: 1 bit   (nack)
+  * probe11: 1 bit   (valid_out)
+  * probe12: 8 bits  (data_out)
+  * probe13: 1 bit   (in_ack_state)
+  * probe14: 1 bit   (slave_responding)
+  * probe15: 1 bit   (ack_detected)
+  * probe16: 1 bit   (vio_req trigger)
+  * probe17: 24 bits (byte count)
+  * probe18: 8 bits  (address)
+
+- Sample depth: 4096 or higher
+- Trigger on probe16 (vio_req) rising edge
+*/
+
+//==============================================================================
+// Usage Instructions - Reading BMP280 Chip ID (0xD0 register)
+//==============================================================================
+/*
+1. Program bitstream to FPGA
+2. Open Hardware Manager
+3. In VIO window, set:
+   - probe_out0 (vio_addr)      = 0xED     (BMP280 read address, 0x76<<1|1)
+   - probe_out1 (vio_sub_addr)  = 0x00D0   (Chip ID register)
+   - probe_out2 (vio_sub_len)   = 0        (8-bit register addressing)
+   - probe_out3 (vio_byte_len)  = 0x000001 (read 1 byte)
+   - probe_out4 (vio_data_write)= 0x00     (don't care for read)
+   
+4. Arm ILA trigger on probe16 (vio_req) rising edge
+
+5. Pulse probe_out5 (vio_req): set to 1, then back to 0
+
+6. Monitor VIO inputs:
+   - probe_in0 (busy) should go 1?0
+   - probe_in2 (data_out) should show 0x58 (BMP280 chip ID)
+   - probe_in3 (valid_out) should pulse high
+   - probe_in4 (ack_detected) should be 1
+   - probe_in6 (state) should sequence: 0?1?3?4?2?3?5?9?10?11?0
+
+7. Check ILA capture:
+   - Look for START condition (SDA falls while SCL high)
+   - Verify address 0xEC sent (write mode)
+   - Check for ACK (SDA low during 9th clock)
+   - Verify register 0xD0 sent
+   - Check for ACK
+   - Look for RESTART condition
+   - Verify address 0xED sent (read mode)
+   - Check for ACK
+   - Watch SDA during 8 SCL pulses = 0x58 (0101_1000)
+   - Verify master sends NACK (SDA high on 9th clock)
+   - Look for STOP condition (SDA rises while SCL high)
+
+Expected I2C sequence:
+START ? 0xEC ? ACK ? 0xD0 ? ACK ? RESTART ? 0xED ? ACK ? 0x58 ? NACK ? STOP
+*/
