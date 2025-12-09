@@ -1,0 +1,385 @@
+/*
+ * BMP280 I2C Interface for Artix-7 FPGA (200MHz clock)
+ * With ILA debug signals - No display needed
+ * BMP280 I2C Address: 0x76 or 0x77 (SDO pin determines address)
+ */
+`timescale 1ns / 1ps
+
+module bmp280_top(
+    input clk,              // 200MHz input clock
+    input rst_n,            // Active low reset (connect to button or switch)
+    
+    // I2C Interface
+    inout scl,
+    inout sda,
+    
+    // Debug LEDs
+    output reg [3:0] led_state,
+    output reg led_busy,
+    output reg led_error,
+    output reg led_data_valid
+);
+
+// BMP280 I2C Address (0x76 if SDO=GND, 0x77 if SDO=VCC)
+localparam [6:0] BMP280_ADDR = 7'h76;  // Change to 7'h77 if needed
+localparam [7:0] CHIP_ID = 8'h58;      // BMP280 chip ID
+
+// BMP280 Register Addresses
+localparam [7:0] REG_CHIP_ID    = 8'hD0;
+localparam [7:0] REG_RESET      = 8'hE0;
+localparam [7:0] REG_CTRL_MEAS  = 8'hF4;
+localparam [7:0] REG_CONFIG     = 8'hF5;
+localparam [7:0] REG_TEMP_MSB   = 8'hFA;
+localparam [7:0] REG_CALIB_START = 8'h88;
+
+// Configuration values
+localparam [7:0] CTRL_MEAS_VAL = 8'b00100111;  // Normal mode, oversampling x1
+localparam [7:0] CONFIG_VAL = 8'b10100000;     // 1000ms standby, filter off
+
+// State machine
+localparam [4:0] INIT           = 5'd0,
+                 READ_CHIP_ID   = 5'd1,
+                 VERIFY_ID      = 5'd2,
+                 SOFT_RESET     = 5'd3,
+                 WAIT_RESET     = 5'd4,
+                 READ_CALIB     = 5'd5,
+                 STORE_CALIB    = 5'd6,
+                 WRITE_CONFIG   = 5'd7,
+                 WRITE_CTRL     = 5'd8,
+                 IDLE_STATE     = 5'd9,
+                 READ_TEMP_REQ  = 5'd10,
+                 READ_TEMP_DATA = 5'd11,
+                 PROCESS_TEMP   = 5'd12,
+                 WRITE_REQ      = 5'd13,
+                 WRITE_WAIT     = 5'd14,
+                 READ_REQ       = 5'd15,
+                 READ_WAIT      = 5'd16,
+                 ERROR          = 5'd17;
+
+// Internal registers
+reg [4:0]  state;
+reg [4:0]  next_state;
+reg [7:0]  data_read;
+reg [19:0] temp_raw;
+reg [15:0] temp_celsius;  // Temperature in Celsius * 100 (e.g., 2534 = 25.34°C)
+reg        en_cntr;
+reg [27:0] cntr;
+reg [23:0] read_bytes;
+reg [5:0]  calib_idx;
+
+// Calibration coefficients
+reg [15:0] dig_T1;
+reg signed [15:0] dig_T2;
+reg signed [15:0] dig_T3;
+
+// For I2C Master
+reg  [7:0]  slave_addr;
+reg  [15:0] i_sub_addr;
+reg         i_sub_len;
+reg  [23:0] i_byte_len;
+reg  [7:0]  i_data_write;
+reg         request_transmit;
+wire [7:0]  data_out;
+wire        valid_out;
+wire        req_data_chunk;
+wire        busy;
+wire        nack;
+
+// **CRITICAL FOR ILA: Internal copies of inout signals**
+// You CANNOT probe inout directly in ILA, must create internal signals
+reg sda_out_en;
+reg sda_out_val;
+reg scl_out_en;
+reg scl_out_val;
+wire sda_in;
+wire scl_in;
+
+// ILA probe signals - these will be visible in ILA
+wire [7:0] ila_data_out;
+wire [7:0] ila_data_read;
+wire [4:0] ila_state;
+wire [19:0] ila_temp_raw;
+wire [15:0] ila_temp_celsius;
+wire ila_busy;
+wire ila_valid_out;
+wire ila_nack;
+wire ila_sda_in;
+wire ila_scl_in;
+wire ila_sda_out;
+wire ila_scl_out;
+wire [15:0] ila_dig_T1;
+wire signed [15:0] ila_dig_T2;
+wire signed [15:0] ila_dig_T3;
+
+// Assign ILA probe signals
+assign ila_data_out = data_out;
+assign ila_data_read = data_read;
+assign ila_state = state;
+assign ila_temp_raw = temp_raw;
+assign ila_temp_celsius = temp_celsius;
+assign ila_busy = busy;
+assign ila_valid_out = valid_out;
+assign ila_nack = nack;
+assign ila_sda_in = sda_in;
+assign ila_scl_in = scl_in;
+assign ila_sda_out = sda_out_val;
+assign ila_scl_out = scl_out_val;
+assign ila_dig_T1 = dig_T1;
+assign ila_dig_T2 = dig_T2;
+assign ila_dig_T3 = dig_T3;
+
+// Main state machine
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        state <= INIT;
+        next_state <= INIT;
+        slave_addr <= {BMP280_ADDR, 1'b0};
+        {i_sub_addr, i_sub_len, i_byte_len} <= 0;
+        {i_data_write, request_transmit} <= 0;
+        {read_bytes, data_read} <= 0;
+        {cntr, en_cntr} <= 0;
+        {dig_T1, dig_T2, dig_T3} <= 0;
+        {temp_raw, temp_celsius} <= 0;
+        calib_idx <= 0;
+        {led_state, led_busy, led_error, led_data_valid} <= 0;
+    end
+    else begin
+        cntr <= en_cntr ? cntr + 1 : 0;
+        led_state <= state[3:0];
+        led_busy <= busy;
+        led_data_valid <= valid_out;
+        
+        case (state)
+            INIT: begin
+                slave_addr <= {BMP280_ADDR, 1'b1};
+                i_sub_addr <= {8'h00, REG_CHIP_ID};
+                i_sub_len <= 1'b0;
+                i_byte_len <= 24'd1;
+                state <= READ_REQ;
+                next_state <= VERIFY_ID;
+            end
+            
+            VERIFY_ID: begin
+                if (data_read == CHIP_ID) begin
+                    state <= SOFT_RESET;
+                end
+                else begin
+                    state <= ERROR;
+                    led_error <= 1;
+                end
+            end
+            
+            SOFT_RESET: begin
+                slave_addr <= {BMP280_ADDR, 1'b0};
+                i_sub_addr <= {8'h00, REG_RESET};
+                i_sub_len <= 1'b0;
+                i_byte_len <= 24'd1;
+                i_data_write <= 8'hB6;
+                state <= WRITE_REQ;
+                next_state <= WAIT_RESET;
+            end
+            
+            WAIT_RESET: begin
+                en_cntr <= 1;
+                if (cntr == 28'd4_000_000) begin  // 20ms delay
+                    en_cntr <= 0;
+                    state <= READ_CALIB;
+                    calib_idx <= 0;
+                end
+            end
+            
+            READ_CALIB: begin
+                slave_addr <= {BMP280_ADDR, 1'b1};
+                i_sub_addr <= {8'h00, REG_CALIB_START};
+                i_sub_len <= 1'b0;
+                i_byte_len <= 24'd6;
+                read_bytes <= 0;
+                state <= READ_REQ;
+                next_state <= STORE_CALIB;
+            end
+            
+            STORE_CALIB: begin
+                case (calib_idx)
+                    0: dig_T1[7:0]  <= data_read;
+                    1: dig_T1[15:8] <= data_read;
+                    2: dig_T2[7:0]  <= data_read;
+                    3: dig_T2[15:8] <= data_read;
+                    4: dig_T3[7:0]  <= data_read;
+                    5: begin
+                        dig_T3[15:8] <= data_read;
+                        state <= WRITE_CONFIG;
+                    end
+                endcase
+                
+                if (calib_idx < 5) begin
+                    calib_idx <= calib_idx + 1;
+                    read_bytes <= read_bytes + 1;
+                    state <= READ_WAIT;
+                    next_state <= STORE_CALIB;
+                end
+            end
+            
+            WRITE_CONFIG: begin
+                slave_addr <= {BMP280_ADDR, 1'b0};
+                i_sub_addr <= {8'h00, REG_CONFIG};
+                i_sub_len <= 1'b0;
+                i_byte_len <= 24'd1;
+                i_data_write <= CONFIG_VAL;
+                state <= WRITE_REQ;
+                next_state <= WRITE_CTRL;
+            end
+            
+            WRITE_CTRL: begin
+                slave_addr <= {BMP280_ADDR, 1'b0};
+                i_sub_addr <= {8'h00, REG_CTRL_MEAS};
+                i_sub_len <= 1'b0;
+                i_byte_len <= 24'd1;
+                i_data_write <= CTRL_MEAS_VAL;
+                state <= WRITE_REQ;
+                next_state <= IDLE_STATE;
+            end
+            
+            IDLE_STATE: begin
+                en_cntr <= 1;
+                if (cntr == 28'd200_000_000) begin  // 1 second
+                    en_cntr <= 0;
+                    state <= READ_TEMP_REQ;
+                end
+            end
+            
+            READ_TEMP_REQ: begin
+                slave_addr <= {BMP280_ADDR, 1'b1};
+                i_sub_addr <= {8'h00, REG_TEMP_MSB};
+                i_sub_len <= 1'b0;
+                i_byte_len <= 24'd3;
+                read_bytes <= 0;
+                state <= READ_REQ;
+                next_state <= READ_TEMP_DATA;
+            end
+            
+            READ_TEMP_DATA: begin
+                case (read_bytes)
+                    0: temp_raw[19:12] <= data_read;
+                    1: temp_raw[11:4]  <= data_read;
+                    2: begin
+                        temp_raw[3:0] <= data_read[7:4];
+                        state <= PROCESS_TEMP;
+                    end
+                endcase
+                
+                if (read_bytes < 2) begin
+                    read_bytes <= read_bytes + 1;
+                    state <= READ_WAIT;
+                    next_state <= READ_TEMP_DATA;
+                end
+            end
+            
+            PROCESS_TEMP: begin
+                // Simplified temperature calculation for ILA viewing
+                // Full BMP280 compensation requires 32-bit signed arithmetic
+                // This gives approximate value
+                temp_celsius <= (temp_raw >> 8);  // Rough approximation
+                state <= IDLE_STATE;
+            end
+            
+            WRITE_REQ: begin
+                request_transmit <= 1;
+                if (busy) begin
+                    request_transmit <= 0;
+                    state <= WRITE_WAIT;
+                end
+            end
+            
+            WRITE_WAIT: begin
+                if (!busy) begin
+                    state <= next_state;
+                end
+            end
+            
+            READ_REQ: begin
+                request_transmit <= 1;
+                if (busy) begin
+                    request_transmit <= 0;
+                    state <= READ_WAIT;
+                end
+            end
+            
+            READ_WAIT: begin
+                if (valid_out) begin
+                    data_read <= data_out;
+                    state <= next_state;
+                end
+            end
+            
+            ERROR: begin
+                led_error <= 1;
+            end
+            
+            default: state <= INIT;
+        endcase
+        
+        if (busy && nack) begin
+            state <= ERROR;
+            led_error <= 1;
+        end
+    end
+end
+
+// I2C bidirectional buffer management
+wire i2c_sda_out;
+wire i2c_scl_out;
+
+// Capture I2C master outputs
+always @(*) begin
+    sda_out_en = (i2c_sda_out !== 1'bz);
+    sda_out_val = (i2c_sda_out === 1'b0) ? 1'b0 : 1'b1;
+    scl_out_en = (i2c_scl_out !== 1'bz);
+    scl_out_val = (i2c_scl_out === 1'b0) ? 1'b0 : 1'b1;
+end
+
+assign sda_in = sda;
+assign scl_in = scl;
+
+// Tristate buffers for I2C
+assign sda = (i2c_sda_out === 1'b0) ? 1'b0 : 1'bz;
+assign scl = (i2c_scl_out === 1'b0) ? 1'b0 : 1'bz;
+
+// I2C Master instance
+i2c_master_200mhz i_i2c_master(
+    .i_clk(clk),
+    .reset_n(rst_n),
+    .i_addr_w_rw(slave_addr),
+    .i_sub_addr(i_sub_addr),
+    .i_sub_len(i_sub_len),
+    .i_byte_len(i_byte_len),
+    .i_data_write(i_data_write),
+    .req_trans(request_transmit),
+    .data_out(data_out),
+    .valid_out(valid_out),
+    .scl_o(i2c_scl_out),
+    .sda_o(i2c_sda_out),
+    .req_data_chunk(req_data_chunk),
+    .busy(busy),
+    .nack(nack)
+);
+
+
+ila_0 your_ila (
+    .clk(clk),
+    .probe0(ila_state),          // 5 bits
+    .probe1(ila_busy),           // 1 bit
+    .probe2(ila_nack),           // 1 bit
+    .probe3(ila_valid_out),      // 1 bit
+    .probe4(ila_data_out),       // 8 bits
+    .probe5(ila_data_read),      // 8 bits
+    .probe6(ila_temp_raw),       // 20 bits
+    .probe7(ila_temp_celsius),   // 16 bits
+    .probe8(ila_sda_in),         // 1 bit
+    .probe9(ila_scl_in),         // 1 bit
+    .probe10(ila_sda_out),       // 1 bit
+    .probe11(ila_scl_out),       // 1 bit
+    .probe12(ila_dig_T1),        // 16 bits
+    .probe13(ila_dig_T2),        // 16 bits
+    .probe14(ila_dig_T3)         // 16 bits
+);
+endmodule
