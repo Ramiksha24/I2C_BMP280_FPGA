@@ -1,0 +1,296 @@
+`timescale 1ns/1ps
+
+module top_bmp280(
+    input  wire clk,       // 100 MHz
+    input  wire rst_n,     // active low reset
+
+    inout  wire scl,
+    inout  wire sda,
+
+    // -------- ILA PROBES (debug signals exposed as ports) -------- //
+
+    // FSM
+    output wire [3:0]  ila_state,
+
+    // I2C control/debug
+    output wire        ila_req,
+    output wire        ila_busy,
+    output wire        ila_nack,
+    output wire        ila_valid_out,
+    output wire [7:0]  ila_data_out,
+
+    // I2C command values
+    output wire [7:0]  ila_slave_addr,
+    output wire [15:0] ila_sub_addr,
+    output wire [23:0] ila_byte_len,
+    output wire [7:0]  ila_data_write,
+
+    // Calibration/debug
+    output wire [6:0]  ila_calib_index,
+    output wire [19:0] ila_raw_temp20,
+
+    // Temperature results (final outputs)
+    output wire [31:0] ila_temp_raw,
+    output wire [31:0] ila_temp_degC_x100,
+    output wire        ila_ready_flag,
+    output wire        ila_error_flag
+);
+
+localparam BMP_ADDR = 7'h76;   // Or 0x77 depending on your module
+localparam CHIP_ID  = 8'h58;
+
+// FSM States
+localparam RESET            = 0,
+           READ_ID          = 1,
+           VERIFY_ID        = 2,
+           WRITE_RESET      = 3,
+           WRITE_CTRL_MEAS  = 4,
+           WRITE_CONFIG     = 5,
+           READ_CALIB       = 6,
+           WAIT_CALIB       = 7,
+           READ_TEMP        = 8,
+           WAIT_TEMP        = 9,
+           PROCESS_TEMP     = 10,
+           ERROR            = 15;
+
+// I2C interface wires
+reg [7:0]  slave_addr;
+reg [15:0] sub_addr;
+reg        sub_len;
+reg [23:0] byte_len;
+reg [7:0]  data_write;
+reg        req;
+wire [7:0] data_out;
+wire       valid_out;
+wire       busy;
+wire       nack;
+
+reg [31:0] temp_raw;   // 20-bit raw reading (packed)
+reg [31:0] temp_degC_x100; // temperature in °C * 100 (for precision)
+reg         ready_flag;     // 1 when new temperature available
+reg         error_flag ;
+
+// Internal regs
+reg [3:0] state;
+reg [6:0] calib_index;
+reg [7:0] calib_mem [0:5];   // dig_T1 LSB,MSB, dig_T2 LSB,MSB, dig_T3 LSB,MSB
+reg [19:0] raw_temp20;
+
+// Compensation registers
+reg signed [31:0] dig_T1, dig_T2, dig_T3;
+reg signed [31:0] adc_T, var1, var2, T_fine;
+assign ila_state          = state;
+assign ila_req            = req;
+assign ila_busy           = busy;
+assign ila_nack           = nack;
+assign ila_valid_out      = valid_out;
+assign ila_data_out       = data_out;
+
+assign ila_slave_addr     = slave_addr;
+assign ila_sub_addr       = sub_addr;
+assign ila_byte_len       = byte_len;
+assign ila_data_write     = data_write;
+
+assign ila_calib_index    = calib_index;
+assign ila_raw_temp20     = raw_temp20;
+
+assign ila_temp_raw       = temp_raw;
+assign ila_temp_degC_x100 = temp_degC_x100;
+assign ila_ready_flag     = ready_flag;
+assign ila_error_flag     = error_flag;
+
+
+always @(posedge clk or negedge rst_n) begin
+    if(!rst_n) begin
+        state <= RESET;
+        req <= 0;
+        ready_flag <= 0;
+        error_flag <= 0;
+    end else begin
+        case(state)
+
+        // -----------------------------------------
+        // 0) Dummy reset wait
+        // -----------------------------------------
+        RESET: begin
+            state <= READ_ID;
+        end
+
+        // -----------------------------------------
+        // 1) Read CHIP ID @ 0xD0
+        // -----------------------------------------
+        READ_ID: begin
+            slave_addr <= {BMP_ADDR,1'b1};
+            sub_addr   <= 16'h00D0;
+            sub_len    <= 0;
+            byte_len   <= 1;
+            req        <= 1;
+            state      <= VERIFY_ID;
+        end
+
+        VERIFY_ID: begin
+            if(valid_out) begin
+                req <= 0;
+                if(data_out == CHIP_ID)
+                    state <= WRITE_RESET;
+                else
+                    state <= ERROR;
+            end
+        end
+
+        // -----------------------------------------
+        // 2) Write reset 0xB6 to 0xE0
+        // -----------------------------------------
+        WRITE_RESET: begin
+            slave_addr <= {BMP_ADDR,1'b0};
+            sub_addr   <= 16'h00E0;
+            sub_len    <= 0;
+            byte_len   <= 1;
+            data_write <= 8'hB6;
+            req        <= 1;
+            state      <= WRITE_CTRL_MEAS;
+        end
+
+        // -----------------------------------------
+        // 3) Write ctrl_meas @0xF4
+        // oversampling temp ×1 + normal mode = 0x27
+        // -----------------------------------------
+        WRITE_CTRL_MEAS: begin
+            if(busy) req <= 0;
+            if(!busy) begin
+                slave_addr <= {BMP_ADDR,1'b0};
+                sub_addr   <= 16'h00F4;
+                sub_len    <= 0;
+                byte_len   <= 1;
+                data_write <= 8'h27;
+                req        <= 1;
+                state      <= WRITE_CONFIG;
+            end
+        end
+
+        // -----------------------------------------
+        // 4) Write config @0xF5
+        // standby 1000ms + filter = 0xA0
+        // -----------------------------------------
+        WRITE_CONFIG: begin
+            if(busy) req <= 0;
+            if(!busy) begin
+                slave_addr <= {BMP_ADDR,1'b0};
+                sub_addr   <= 16'h00F5;
+                sub_len    <= 0;
+                byte_len   <= 1;
+                data_write <= 8'hA0;
+                req        <= 1;
+                state      <= READ_CALIB;
+            end
+        end
+
+        // -----------------------------------------
+        // 5) Read calibration registers 0x88-0x8D
+        // -----------------------------------------
+        READ_CALIB: begin
+            if(busy) req <= 0;
+            if(!busy) begin
+                slave_addr <= {BMP_ADDR,1'b1};
+                sub_addr   <= 16'h0088;
+                sub_len    <= 0;
+                byte_len   <= 6;
+                req        <= 1;
+                calib_index <= 0;
+                state <= WAIT_CALIB;
+            end
+        end
+
+        WAIT_CALIB: begin
+            if(valid_out) begin
+                calib_mem[calib_index] <= data_out;
+                calib_index <= calib_index + 1;
+
+                if(calib_index == 5) begin
+                    req <= 0;
+                    dig_T1 <= {calib_mem[1], calib_mem[0]}; // unsigned
+                    dig_T2 <= $signed({calib_mem[3], calib_mem[2]});
+                    dig_T3 <= $signed({calib_mem[5], calib_mem[4]});
+                    state <= READ_TEMP;
+                end
+            end
+        end
+
+        // -----------------------------------------
+        // 6) Read temperature MSB/LSB/XLSB
+        // -----------------------------------------
+        READ_TEMP: begin
+            slave_addr <= {BMP_ADDR,1'b1};
+            sub_addr   <= 16'h00FA;
+            sub_len    <= 0;
+            byte_len   <= 3;
+            req        <= 1;
+            state      <= WAIT_TEMP;
+        end
+
+        WAIT_TEMP: begin
+            if(valid_out) begin
+                req <= 0;
+                raw_temp20[19:16] <= data_out[3:0]; // XLSB last nibble
+
+                // LSB
+                @(posedge clk);
+                raw_temp20[15:8] <= data_out;
+
+                // MSB
+                @(posedge clk);
+                raw_temp20[7:0] <= data_out;
+
+                state <= PROCESS_TEMP;
+            end
+        end
+
+        // -----------------------------------------
+        // 7) Apply Bosch compensation formula
+        // -----------------------------------------
+        PROCESS_TEMP: begin
+            adc_T <= raw_temp20;
+
+            // T_fine calculations
+            var1 <= ((((adc_T >> 3) - (dig_T1 << 1))) * dig_T2) >> 11;
+            var2 <= (((((adc_T >> 4) - dig_T1) *
+                       ((adc_T >> 4) - dig_T1)) >> 12) *
+                       dig_T3) >> 14;
+
+            T_fine <= var1 + var2;
+
+            temp_degC_x100 <= (T_fine * 5 + 128) >> 8;  // °C * 100
+            temp_raw <= raw_temp20;
+
+            ready_flag <= 1;
+            state <= READ_TEMP;  // continuous mode
+        end
+
+        ERROR: begin
+            error_flag <= 1;
+        end
+
+        endcase
+    end
+end
+
+// I2C module instance
+i2c_master u_i2c (
+    .i_clk(clk),
+    .reset_n(rst_n),
+    .i_addr_w_rw(slave_addr),
+    .i_sub_addr(sub_addr),
+    .i_sub_len(sub_len),
+    .i_byte_len(byte_len),
+    .i_data_write(data_write),
+    .req_trans(req),
+    .data_out(data_out),
+    .valid_out(valid_out),
+    .scl_o(scl),
+    .sda_o(sda),
+    .req_data_chunk(),
+    .busy(busy),
+    .nack(nack)
+);
+
+endmodule
