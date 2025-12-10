@@ -1,0 +1,322 @@
+/***
+ * BMP280 Pressure/Temperature Sensor
+ * Target: Artix-7 @ 100MHz
+ * CORRECTED VERSION with VIO reset control
+ */
+`timescale 1ns/1ps
+
+module bmp280_top(
+    input clk,          // 100MHz (from clock wizard)
+    
+    // BMP280 I2C Interface
+    inout scl,
+    inout sda,
+    
+    // Optional: Status LEDs
+    output reg [3:0] status_led
+);
+
+// ============================================================================
+// BMP280 PARAMETERS
+// ============================================================================
+localparam [6:0] I2C_ADDR = 7'h76;      
+localparam [8:0] DEVICE_ID = 8'h58;     
+
+// BMP280 Register Addresses 
+localparam [7:0] REG_CHIP_ID   = 8'hD0; 
+localparam [7:0] REG_CTRL_MEAS = 8'hF4; 
+localparam [7:0] REG_PRESS_MSB = 8'hF7; 
+localparam [7:0] REG_TEMP_MSB  = 8'hFA; 
+
+// BMP280 Configuration
+localparam [7:0] CONFIG_BITS = 8'b00100111;
+
+// ============================================================================
+// STATE MACHINE
+// ============================================================================
+localparam [3:0] SETUP        = 4'd0,
+                 VERIFY_ID    = 4'd1,
+                 WRITE_CONFIG = 4'd2,
+                 WRITE_REQ    = 4'd3,
+                 WRITE_FINISH = 4'd4,
+                 SENSOR_DATA_AQ = 4'd5,  
+                 READ_REQ     = 4'd6,
+                 AWAIT_DATA   = 4'd7,
+                 INCR_DATA_AQ = 4'd8,
+                 ERROR        = 4'd9;
+
+// ============================================================================
+// INTERNAL REGISTERS
+// ============================================================================
+wire rst;  // Reset from VIO
+
+reg [3:0]  state;
+reg [3:0]  next_state;
+reg [7:0]  data_read;
+reg [23:0] press_data;
+reg [15:0] temp_data;
+reg        en_cntr;
+reg [26:0] cntr;
+reg [23:0] read_bytes;
+reg        sensor_data_ready;
+
+// I2C Master Interface
+reg  [7:0]  slave_addr;
+reg  [15:0] i_sub_addr;
+reg         i_sub_len;
+reg  [23:0] i_byte_len;
+reg  [7:0]  i_data_write;
+reg         request_transmit;
+wire [7:0]  data_out;
+wire        valid_out;
+wire        req_data_chunk;
+wire        busy;
+wire        nack;
+
+// ============================================================================
+// I2C TRI-STATE SIGNALS (CRITICAL!)
+// ============================================================================
+wire scl_out, scl_in, scl_oe;
+wire sda_out, sda_in, sda_oe;
+
+// Tri-state buffers for bidirectional I2C pins
+assign scl = scl_oe ? scl_out : 1'bz;
+assign sda = sda_oe ? sda_out : 1'bz;
+assign scl_in = scl;
+assign sda_in = sda;
+
+// ============================================================================
+// DEBUG SIGNALS FROM I2C MASTER
+// ============================================================================
+wire [3:0]  dbg_state;
+wire [7:0]  dbg_byte_sr;
+wire [2:0]  dbg_bit_cntr;
+wire        dbg_scl_internal;
+wire        dbg_sda_internal;
+wire        dbg_sda_in;
+wire        dbg_scl_in;
+wire [23:0] dbg_byte_count;
+
+// Clock frequency parameter
+localparam CLOCK_FREQ = 100_000_000;  // 100MHz
+localparam ONE_SECOND = CLOCK_FREQ;
+
+// ============================================================================
+// MAIN STATE MACHINE
+// ============================================================================
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        slave_addr <= {I2C_ADDR, 1'b1};
+        {i_sub_addr, i_sub_len, i_byte_len} <= 0;
+        {i_data_write, request_transmit} <= 0;
+        
+        state <= SETUP;
+        next_state <= SETUP;
+        {read_bytes, data_read, sensor_data_ready} <= 0;
+        {cntr, en_cntr} <= 0;
+        {press_data, temp_data} <= 0;
+        status_led <= 4'b0000;
+    end
+    else begin
+        cntr <= en_cntr ? cntr + 1 : 0;
+        sensor_data_ready <= 1'b0;
+        
+        case(state)
+            SETUP: begin
+    // Try reading from address 0x76 (write address 0xEC)
+    slave_addr <= 8'hEC;  // 0x76 << 1 | 0 (write)
+    i_sub_addr <= 16'h00D0;  // Chip ID register
+    i_byte_len <= 24'd0;  // No data, just check ACK
+    state <= WRITE_REQ;
+end
+            
+            VERIFY_ID: begin
+                if (data_read == DEVICE_ID) begin
+                    state <= WRITE_CONFIG;
+                    status_led <= 4'b0010;
+                end
+                else begin
+                    state <= ERROR;
+                    status_led <= 4'b1111;
+                end
+            end
+            
+            WRITE_CONFIG: begin
+                slave_addr <= {I2C_ADDR, 1'b0};
+                i_sub_addr <= {8'h00, REG_CTRL_MEAS};
+                i_sub_len <= 1'b0;
+                i_byte_len <= 24'd1;
+                i_data_write <= CONFIG_BITS;
+                request_transmit <= 1'b1;
+                state <= WRITE_REQ;
+                next_state <= WRITE_FINISH;
+                status_led <= 4'b0011;
+            end
+            
+            WRITE_REQ: begin
+                if (busy) begin
+                    state <= WRITE_FINISH;
+                    request_transmit <= 1'b0;
+                end
+            end
+            
+            WRITE_FINISH: begin
+                if (!busy) begin
+                    state <= SENSOR_DATA_AQ;
+                    en_cntr <= 1'b1;
+                    status_led <= 4'b0100;
+                end
+            end
+            
+            SENSOR_DATA_AQ: begin
+                if (cntr == ONE_SECOND) begin
+                    en_cntr <= 1'b0;
+                    slave_addr <= {I2C_ADDR, 1'b1};
+                    i_sub_addr <= {8'h00, REG_TEMP_MSB};
+                    i_sub_len <= 1'b0;
+                    i_byte_len <= 24'd2;
+                    i_data_write <= 8'b0;
+                    state <= READ_REQ;
+                    next_state <= INCR_DATA_AQ;
+                    request_transmit <= 1'b1;
+                    read_bytes <= 0;
+                    status_led <= 4'b0101;
+                end
+            end
+            
+            READ_REQ: begin
+                if (busy) begin
+                    state <= AWAIT_DATA;
+                    request_transmit <= 1'b0;
+                end
+            end
+            
+            AWAIT_DATA: begin
+                if (valid_out) begin
+                    data_read <= data_out;
+                    state <= next_state;
+                    status_led <= 4'b0110;
+                end
+            end
+            
+            INCR_DATA_AQ: begin
+                temp_data[(1 - read_bytes) * 8 +: 8] <= data_read;
+                
+                if (read_bytes == i_byte_len - 1) begin
+                    state <= SENSOR_DATA_AQ;
+                    sensor_data_ready <= 1'b1;
+                    en_cntr <= 1'b1;
+                    status_led <= 4'b0111;
+                end
+                else begin
+                    read_bytes <= read_bytes + 1;
+                    state <= AWAIT_DATA;
+                end
+            end
+            
+            ERROR: begin
+                status_led <= 4'b1111;
+            end
+            
+            default:
+                state <= SETUP;
+        endcase
+        
+        if (busy && nack) begin
+            state <= ERROR;
+            status_led <= 4'b1010;
+        end
+    end
+end
+
+// ============================================================================
+// I2C MASTER INSTANTIATION - CORRECTED!
+// ============================================================================
+i2c_master_bmp280 i2c_inst (
+    .clk(clk),
+    .reset_n(rst),  // VIO reset signal
+    
+    // Control Interface
+    .i_addr_w_rw(slave_addr),
+    .i_sub_addr(i_sub_addr),
+    .i_sub_len(i_sub_len),
+    .i_byte_len(i_byte_len),
+    .i_data_write(i_data_write),
+    .req_trans(request_transmit),
+    
+    // Data Interface
+    .data_out(data_out),
+    .valid_out(valid_out),
+    
+    // I2C Physical Interface
+    .scl_out(scl_out),
+    .scl_in(scl_in),
+    .scl_oe(scl_oe),
+    .sda_out(sda_out),
+    .sda_in(sda_in),
+    .sda_oe(sda_oe),
+    
+    // Status
+    .req_data_chunk(req_data_chunk),
+    .busy(busy),
+    .nack(nack),
+    
+    // Debug outputs for ILA
+    .dbg_state(dbg_state),
+    .dbg_byte_sr(dbg_byte_sr),
+    .dbg_bit_cntr(dbg_bit_cntr),
+    .dbg_scl_internal(dbg_scl_internal),
+    .dbg_sda_internal(dbg_sda_internal),
+    .dbg_sda_in(dbg_sda_in),
+    .dbg_scl_in(dbg_scl_in),
+    .dbg_byte_count(dbg_byte_count)
+);
+
+// ============================================================================
+// VIO - VIRTUAL INPUT/OUTPUT FOR RESET CONTROL
+// ============================================================================
+vio_1 vio_inst (
+    .clk(clk),
+    .probe_out0(rst)  // 1-bit output to control reset
+);
+
+// ============================================================================
+// ILA - INTEGRATED LOGIC ANALYZER
+// ============================================================================
+ila_4 ila_inst (
+    .clk(clk),
+    
+    // PHYSICAL I2C PINS
+    .probe0(scl),                   // [0:0] - Physical SCL pin
+    .probe1(sda),                   // [0:0] - Physical SDA pin
+    
+    // INTERNAL I2C SIGNALS
+    .probe2(scl_out),               // [0:0] - Master's SCL output
+    .probe3(sda_out),               // [0:0] - Master's SDA output
+    .probe4(scl_oe),                // [0:0] - SCL output enable
+    .probe5(sda_oe),                // [0:0] - SDA output enable
+    .probe6(dbg_scl_internal),      // [0:0] - Internal 400kHz clock
+    .probe7(dbg_sda_internal),      // [0:0] - Internal SDA control
+    
+    // FSM STATE
+    .probe8(state),                 // [3:0] - Top-level state
+    .probe9(dbg_state),             // [3:0] - I2C master state
+    .probe10(dbg_byte_sr),          // [7:0] - Shift register
+    .probe11(dbg_bit_cntr),         // [2:0] - Bit counter
+    
+    // DATA CAPTURE
+    .probe12(data_out),             // [7:0] - Raw byte from I2C
+    .probe13(valid_out),            // [0:0] - Data valid (TRIGGER ON THIS!)
+    .probe14(data_read),            // [7:0] - Captured in register
+    .probe15(temp_data),            // [15:0] - Final temperature
+    
+    // STATUS & CONTROL
+    .probe16(busy),                 // [0:0] - Transaction active
+    .probe17(nack),                 // [0:0] - NACK error
+    .probe18(request_transmit),     // [0:0] - Transaction trigger
+    .probe19(slave_addr),           // [7:0] - I2C address being used
+    .probe20(rst),                  // [0:0] - Reset signal from VIO
+    .probe21(dbg_byte_count)        // [23:0] - Byte counter
+);
+
+endmodule
