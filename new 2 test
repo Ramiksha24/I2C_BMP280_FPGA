@@ -1,0 +1,163 @@
+// Testbench for i2c_master_bd (Block Diagram version)
+// Tests separate I/O signals
+
+`timescale 1ns/1ps
+
+module tb_i2c_bd;
+
+    reg clk;
+    reg rst_n;
+    reg start;
+    reg [7:0] slave_addr;
+    reg [7:0] reg_addr;
+    wire [7:0] data_out;
+    wire busy;
+    wire done;
+    
+    // Separate I/O signals
+    wire scl;
+    wire sda_out;
+    wire sda_oe;
+    reg sda_in;
+    
+    // Instantiate I2C master with separate I/O
+    i2c_master_bd dut (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(start),
+        .slave_addr(slave_addr),
+        .reg_addr(reg_addr),
+        .data_out(data_out),
+        .busy(busy),
+        .done(done),
+        .scl(scl),
+        .sda_out(sda_out),
+        .sda_oe(sda_oe),
+        .sda_in(sda_in)
+    );
+    
+    // Simulate pull-up and bidirectional behavior
+    reg sda_external;
+    always @(*) begin
+        if (sda_oe)
+            sda_external = sda_out;  // Master drives
+        else
+            sda_external = 1'b1;     // Pull-up (or slave drives low for ACK)
+    end
+    
+    // Feedback to master
+    always @(*) begin
+        sda_in = sda_external;
+    end
+    
+    // 100MHz clock
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk;
+    end
+    
+    // Monitor signals
+    integer scl_count;
+    
+    always @(negedge scl) begin
+        if (rst_n && busy) begin
+            scl_count = scl_count + 1;
+            $display("Time %0t: SCL negedge #%0d, sda_out=%b, sda_oe=%b, sda_in=%b", 
+                     $time, scl_count, sda_out, sda_oe, sda_in);
+        end
+    end
+    
+    // Simulate slave ACK responses
+    // Pull SDA low during ACK bit when master releases bus
+    always @(*) begin
+        // During ACK slots (when sda_oe=0), simulate slave pulling low
+        if (!sda_oe && scl) begin
+            // Check if this is an ACK slot (we're not reading data)
+            // Simple simulation: just pull low for ACK
+            force sda_external = 1'b0;  // Slave ACK
+        end else begin
+            release sda_external;
+        end
+    end
+    
+    // Test sequence
+    initial begin
+        $display("========================================");
+        $display("Block Diagram I2C Master Test");
+        $display("Separate I/O signals for VIO/ILA");
+        $display("========================================");
+        $display("");
+        
+        // Initialize
+        rst_n = 0;
+        start = 0;
+        slave_addr = 7'h76;
+        reg_addr = 8'hD0;
+        scl_count = 0;
+        
+        // Reset
+        #100;
+        rst_n = 1;
+        #100;
+        
+        $display("Time %0t: Starting I2C transaction...", $time);
+        $display("  Config: slave_addr=0x%h, reg_addr=0x%h", slave_addr, reg_addr);
+        $display("");
+        
+        // Start transaction
+        @(posedge clk);
+        start = 1;
+        @(posedge clk);
+        start = 0;
+        
+        // Wait for busy
+        wait(busy);
+        $display("Time %0t: ✓ Transaction started (busy=1)", $time);
+        
+        // Monitor START condition
+        wait(scl == 1 && sda_oe == 1 && sda_out == 0);
+        $display("Time %0t: ✓ START detected (SDA=0 while SCL=1)", $time);
+        
+        // Wait for done
+        wait(done);
+        $display("");
+        $display("Time %0t: ✓ Transaction completed (done=1)", $time);
+        $display("  SCL toggles: %0d", scl_count);
+        $display("  Data read: 0x%h", data_out);
+        
+        if (scl_count >= 36) begin
+            $display("");
+            $display("✓✓✓ SUCCESS!");
+            $display("    Separate I/O signals working correctly");
+            $display("    Ready for Block Diagram + VIO/ILA");
+        end
+        
+        #1000;
+        
+        $display("");
+        $display("========================================");
+        $display("Test Complete - Signals Summary");
+        $display("========================================");
+        $display("scl:     I2C clock output");
+        $display("sda_out: SDA data output (what master wants to send)");
+        $display("sda_oe:  SDA output enable (1=drive, 0=input)");
+        $display("sda_in:  SDA data input (what master reads)");
+        $display("");
+        $display("These signals can connect directly to VIO/ILA!");
+        $finish;
+    end
+    
+    // Timeout
+    initial begin
+        #2000000;
+        $display("TIMEOUT");
+        $finish;
+    end
+    
+    // VCD dump
+    initial begin
+        $dumpfile("i2c_bd.vcd");
+        $dumpvars(0, tb_i2c_bd);
+    end
+
+endmodule
