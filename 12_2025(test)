@@ -1,0 +1,138 @@
+// Simple Testbench - Just verify I2C signals work
+`timescale 1ns/1ps
+
+module tb_i2c_simple;
+
+    reg clk;
+    reg rst_n;
+    reg start;
+    reg [7:0] slave_addr;
+    reg [7:0] reg_addr;
+    wire [7:0] data_out;
+    wire busy;
+    wire done;
+    wire scl;
+    wire sda;
+    
+    // Pull-up on SDA (simulates external pull-up)
+    pullup(sda);
+    
+    // Instantiate I2C master
+    i2c_master_simple dut (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(start),
+        .slave_addr(slave_addr),
+        .reg_addr(reg_addr),
+        .data_out(data_out),
+        .busy(busy),
+        .done(done),
+        .scl(scl),
+        .sda(sda)
+    );
+    
+    // 100MHz clock
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk;
+    end
+    
+    // Monitor I2C activity
+    integer scl_toggles;
+    integer sda_changes;
+    
+    always @(negedge scl) begin
+        if (rst_n) begin
+            scl_toggles = scl_toggles + 1;
+            $display("Time %0t: SCL negedge #%0d, SDA=%b", $time, scl_toggles, sda);
+        end
+    end
+    
+    always @(sda) begin
+        if (rst_n && busy) begin
+            sda_changes = sda_changes + 1;
+        end
+    end
+    
+    // Test
+    initial begin
+        $display("========================================");
+        $display("Simple I2C Master Test");
+        $display("========================================");
+        $display("Testing: START, data transmission, STOP");
+        $display("");
+        
+        // Initialize
+        rst_n = 0;
+        start = 0;
+        slave_addr = 7'h76;  // BMP280 address
+        reg_addr = 8'hD0;    // Device ID register
+        scl_toggles = 0;
+        sda_changes = 0;
+        
+        // Reset
+        #100;
+        rst_n = 1;
+        #100;
+        
+        $display("Time %0t: Starting I2C transaction...", $time);
+        $display("  Slave Address: 0x%h", slave_addr);
+        $display("  Register: 0x%h", reg_addr);
+        $display("");
+        
+        // Start transaction
+        @(posedge clk);
+        start = 1;
+        @(posedge clk);
+        start = 0;
+        
+        // Wait for busy to go high
+        wait(busy);
+        $display("Time %0t: ✓ Transaction started (busy=1)", $time);
+        
+        // Monitor for START condition (SDA falls while SCL high)
+        wait(scl == 1 && sda == 0);
+        $display("Time %0t: ✓ START condition detected (SDA LOW while SCL HIGH)", $time);
+        
+        // Wait for transaction to complete
+        wait(done);
+        $display("");
+        $display("Time %0t: ✓ Transaction completed (done=1)", $time);
+        $display("  SCL toggles: %0d", scl_toggles);
+        $display("  SDA changes: %0d", sda_changes);
+        
+        // Check if signals actually toggled
+        if (scl_toggles > 20) begin
+            $display("");
+            $display("✓✓✓ SUCCESS! I2C signals are working correctly");
+            $display("    SCL toggled %0d times (expected ~30-40 for full transaction)", scl_toggles);
+            $display("    SDA changed %0d times", sda_changes);
+        end else begin
+            $display("");
+            $display("✗✗✗ FAILED! SCL didn't toggle enough");
+        end
+        
+        #1000;
+        
+        $display("");
+        $display("========================================");
+        $display("Test Complete");
+        $display("========================================");
+        $finish;
+    end
+    
+    // Timeout
+    initial begin
+        #1000000; // 1ms timeout
+        $display("");
+        $display("✗ TIMEOUT after 1ms");
+        $finish;
+    end
+    
+    // VCD dump
+    initial begin
+        $dumpfile("i2c_simple.vcd");
+        $dumpvars(0, tb_i2c_simple);
+    end
+
+endmodule
