@@ -331,12 +331,15 @@ IOBUF IOBUF_sda (
                                 scl <= 1;
                                 // Sample data on rising edge
                                 shift_reg <= {shift_reg[6:0], sda_in};
+                                 if (bit_cnt == 1) begin
+                                    data_out <= {shift_reg[6:0], sda_in};
+                                end
+                            
                             end
                             3: begin
                                 scl <= 0;
                                 bit_cnt <= bit_cnt - 1;
                                 if (bit_cnt == 1) begin
-                                    data_out <= shift_reg;
                                     state <= NACK;
                                 end
                             end
